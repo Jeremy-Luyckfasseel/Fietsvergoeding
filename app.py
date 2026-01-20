@@ -1,30 +1,3 @@
-"""
-Fietsvergoeding PoC v4.1 - Enhanced Edition
-=============================================
-Version: 4.1 (Compliant with Updated Functional Analysis)
-Author: Antigravity AI
-
-Beschrijving:
-Deze applicatie berekent fietsvergoedingen met strikte scheiding tussen HR (Configuratie/Master Data)
-en Werknemers (Transactionele Data).
-
-Nieuwe Features v4.1:
-- **Enkel/Retour keuze**: Medewerkers kunnen kiezen tussen enkele rit of heen-en-terug
-- **Toekomst validatie**: Geen ritten in de toekomst toegestaan
-- Keuze tussen maandelijkse en jaarlijkse limieten (België)
-- Historische correcties (huidige maand + vorige maand tot deadline)
-- Export processing met ride marking om dubbele betalingen te voorkomen
-- Export geschiedenis tracking
-- Verbeterde employee portal met realtime totalen en status dashboard
-- Maand-vergrendeling na export
-
-Architectuur & Data Management:
-1. Configuratie Data: Tarieven, limieten en deadline (beheerd door HR).
-2. Master Data: Werknemers en hun vaste trajecten (Verklaring op Eer).
-3. Transactionele Data: De effectieve ritten (gegenereerd door werknemers).
-4. Export History: Logging van exports naar Payroll.
-"""
-
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date
