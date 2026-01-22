@@ -1,40 +1,3 @@
-"""
-Fietsvergoeding PoC v4.3 - Stakeholder Feedback Edition
-========================================================
-Version: 4.3 (Stakeholder Feedback Implemented)
-Author: Antigravity AI
-
-Beschrijving:
-Deze applicatie berekent fietsvergoedingen met strikte scheiding tussen HR (Configuratie/Master Data)
-en Werknemers (Transactionele Data).
-
-Nieuwe Features v4.3 (Stakeholder Feedback):
-- **NL Bedrijfsfiets Tarief Configureerbaar**: HR kan nu een vergoeding instellen voor bedrijfsfietsen (wel belastbaar)
-- **Fiscaal Statuut in Export**: CSV export bevat nu 'BELAST' of 'ONBELAST' kolom voor Payroll
-- **Deadline Uitzonderingen**: HR kan per medewerker een tijdelijke uitzondering toestaan
-
-Features v4.2:
-- **Configureerbaar Limiet Enforcement**: Keuze tussen BLOCK (hard block) of CAP (afkapping tot limiet)
-- **Ritten Vandaag Indicator**: Realtime teller hoeveel ritten vandaag al ingevoerd (X/2)
-- **Verbeterde UX Tooltips**: Duidelijke uitleg over 2-ritten flexibiliteit
-
-Features v4.1:
-- **Enkel/Retour keuze**: Medewerkers kunnen kiezen tussen enkele rit of heen-en-terug
-- **Toekomst validatie**: Geen ritten in de toekomst toegestaan
-- Keuze tussen maandelijkse en jaarlijkse limieten (België)
-- Historische correcties (huidige maand + vorige maand tot deadline)
-- Export processing met ride marking om dubbele betalingen te voorkomen
-- Export geschiedenis tracking
-- Verbeterde employee portal met realtime totalen en status dashboard
-- Maand-vergrendeling na export
-
-Architectuur & Data Management:
-1. Configuratie Data: Tarieven, limieten, deadline en enforcement mode (beheerd door HR).
-2. Master Data: Werknemers en hun vaste trajecten (Verklaring op Eer).
-3. Transactionele Data: De effectieve ritten (gegenereerd door werknemers).
-4. Export History: Logging van exports naar Payroll.
-"""
-
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date
@@ -187,11 +150,28 @@ def validate_ride_submission(employee, date_obj, trajectory_name, ride_type):
         # Te oud of na deadline
         return False, [f"❌ Deze datum kan niet meer worden ingevoerd (alleen huidige + vorige maand tot {deadline_previous_month})"], 0.0
 
-    # 3. Daglimiet Check (PO Requirement: Hard Block at 2)
+    # 3. Daglimiet Check - Rit-Punten Systeem (v4.4)
+    # Nieuwe logica: Enkel=1 punt, Heen-en-Terug=2 punten, max 2 punten/dag
     rides_today = [r for r in st.session_state.rides 
                    if r["employee_id"] == employee["id"] and r["date"] == date_obj]
-    if len(rides_today) >= cfg["MAX_RIDES_DAY"]:
-        return False, ["❌ Je hebt het maximum van 2 ritten voor deze datum bereikt."], 0.0
+    
+    # Bereken huidige rit-punten
+    current_points = 0
+    for ride in rides_today:
+        if ride.get("ride_type") == "Heen-en-Terug":
+            current_points += 2
+        else:  # "Enkel" of oude ritten zonder ride_type
+            current_points += 1
+    
+    # Bereken punten voor nieuwe rit
+    new_ride_points = 2 if ride_type == "Heen-en-Terug" else 1
+    total_points = current_points + new_ride_points
+    
+    # Valideer tegen limiet
+    if total_points > cfg["MAX_RIDES_DAY"]:
+        return False, [
+            f"❌ Daglimiet overschreden: je hebt al {current_points}/2 rit-punten vandaag. "
+        ], 0.0
 
     # 4. Berekening (NU MET KEUZE ENKEL/RETOUR - v4.1)
     factor = 2 if ride_type == "Heen-en-Terug" else 1
@@ -682,12 +662,20 @@ def render_employee_portal():
                     
                     st.progress(progress, text=f"€{remaining:.2f} resterend")
         
-        # NIEUWE FEATURE v4.2: Ritten Vandaag Counter
+        # NIEUWE FEATURE v4.4: Rit-Punten Vandaag (Enkel=1, Heen-Terug=2)
         st.divider()
-        rides_today_count = len([r for r in st.session_state.rides 
-                                 if r["employee_id"] == employee["id"] 
-                                 and r["date"] == today])
-        st.caption(f"🚴 **Ritten vandaag:** {rides_today_count}/{st.session_state.config['MAX_RIDES_DAY']}")
+        rides_today = [r for r in st.session_state.rides 
+                       if r["employee_id"] == employee["id"] and r["date"] == today]
+        
+        # Bereken rit-punten voor vandaag
+        points_today = 0
+        for ride in rides_today:
+            if ride.get("ride_type") == "Heen-en-Terug":
+                points_today += 2
+            else:
+                points_today += 1
+        
+        st.caption(f"🚴 **Rit-punten vandaag:** {points_today}/{st.session_state.config['MAX_RIDES_DAY']} (Enkel=1pt, Heen-Terug=2pt)")
         
         # Deadline reminder
         deadline_day = st.session_state.config["DEADLINE_DAY"]
@@ -794,7 +782,7 @@ def render_employee_portal():
 # =============================================================================
 
 def main():
-    st.set_page_config(page_title="Fietsvergoeding v4.3", layout="wide")
+    st.set_page_config(page_title="Fietsvergoeding v4.4", layout="wide")
     init_session_state()
     
     # SIDEBAR: Rol Selectie (RBAC Simulatie)
