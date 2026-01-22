@@ -1,6 +1,5 @@
 # 🚲 Fietsvergoeding Applicatie
 
-**Version:** 4.4 (Smart Daily Limit Validation)  
 **Status:** Production Ready PoC  
 **Framework:** Python + Streamlit
 
@@ -38,7 +37,7 @@ cd Fietsvergoeding
 pip install -r requirements.txt
 
 # Start applicatie
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
 De applicatie opent automatisch in je browser op `http://localhost:8501`
@@ -231,20 +230,8 @@ date;employee_id;employee_name;distance;amount;fiscal_status
 
 ---
 
-## 🤝 Support
-
-Voor vragen of issues:
-
-1. Check de User Stories voor acceptatiecriteria
-2. Bekijk de Walkthrough voor voorbeelden
-3. Raadpleeg de Functionele Analyse voor business context
-
----
-
 ## 📄 License
 
 Proof of Concept - Internal Use Only
 
 ---
-
-**Developed with ❤️ by Antigravity AI**
