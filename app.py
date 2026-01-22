@@ -1,14 +1,24 @@
 """
-Fietsvergoeding PoC v4.1 - Enhanced Edition
-=============================================
-Version: 4.1 (Compliant with Updated Functional Analysis)
+Fietsvergoeding PoC v4.3 - Stakeholder Feedback Edition
+========================================================
+Version: 4.3 (Stakeholder Feedback Implemented)
 Author: Antigravity AI
 
 Beschrijving:
 Deze applicatie berekent fietsvergoedingen met strikte scheiding tussen HR (Configuratie/Master Data)
 en Werknemers (Transactionele Data).
 
-Nieuwe Features v4.1:
+Nieuwe Features v4.3 (Stakeholder Feedback):
+- **NL Bedrijfsfiets Tarief Configureerbaar**: HR kan nu een vergoeding instellen voor bedrijfsfietsen (wel belastbaar)
+- **Fiscaal Statuut in Export**: CSV export bevat nu 'BELAST' of 'ONBELAST' kolom voor Payroll
+- **Deadline Uitzonderingen**: HR kan per medewerker een tijdelijke uitzondering toestaan
+
+Features v4.2:
+- **Configureerbaar Limiet Enforcement**: Keuze tussen BLOCK (hard block) of CAP (afkapping tot limiet)
+- **Ritten Vandaag Indicator**: Realtime teller hoeveel ritten vandaag al ingevoerd (X/2)
+- **Verbeterde UX Tooltips**: Duidelijke uitleg over 2-ritten flexibiliteit
+
+Features v4.1:
 - **Enkel/Retour keuze**: Medewerkers kunnen kiezen tussen enkele rit of heen-en-terug
 - **Toekomst validatie**: Geen ritten in de toekomst toegestaan
 - Keuze tussen maandelijkse en jaarlijkse limieten (België)
@@ -19,7 +29,7 @@ Nieuwe Features v4.1:
 - Maand-vergrendeling na export
 
 Architectuur & Data Management:
-1. Configuratie Data: Tarieven, limieten en deadline (beheerd door HR).
+1. Configuratie Data: Tarieven, limieten, deadline en enforcement mode (beheerd door HR).
 2. Master Data: Werknemers en hun vaste trajecten (Verklaring op Eer).
 3. Transactionele Data: De effectieve ritten (gegenereerd door werknemers).
 4. Export History: Logging van exports naar Payroll.
@@ -46,7 +56,9 @@ def init_session_state():
             "BE_LIMIT_TYPE": "YEARLY",  # NEW: YEARLY or MONTHLY
             "BE_YEARLY_LIMIT": 3160.00,
             "BE_MONTHLY_LIMIT": 265.00,  # NEW: ~3160/12
+            "BE_LIMIT_ENFORCE_MODE": "BLOCK",  # NEW v4.2: BLOCK or CAP
             "NL_RATE": 0.23,
+            "NL_COMPANY_BIKE_RATE": 0.00,  # NEW v4.3: Configurable rate for NL company bikes (can be > 0 but taxable)
             "DEADLINE_DAY": 15,
             "MAX_RIDES_DAY": 2
         }
@@ -87,6 +99,10 @@ def init_session_state():
     # 4. EXPORT HISTORY (Logging van exports naar Payroll)
     if "export_history" not in st.session_state:
         st.session_state.export_history = []
+    
+    # 5. DEADLINE EXCEPTIONS (v4.3: Per-employee deadline overrides)
+    if "deadline_exceptions" not in st.session_state:
+        st.session_state.deadline_exceptions = {}  # {employee_id: expiration_date}
 
 # =============================================================================
 # 2. BUSINESS LOGIC (Core Domain)
@@ -146,16 +162,27 @@ def validate_ride_submission(employee, date_obj, trajectory_name, ride_type):
     # Deadline voor vorige maand
     deadline_previous_month = date(today.year, today.month, cfg["DEADLINE_DAY"])
     
+    # NEW v4.3: Check for deadline exceptions
+    has_exception = False
+    if employee["id"] in st.session_state.deadline_exceptions:
+        exception_date = st.session_state.deadline_exceptions[employee["id"]]
+        if today <= exception_date:
+            has_exception = True
+            msgs.append(f"ℹ️ Uitzondering actief: je mag ritten tot {exception_date} invoeren")
+    
     # Logica:
     # - Huidige maand: altijd toegestaan
-    # - Vorige maand: alleen tot deadline van huidige maand
+    # - Vorige maand: alleen tot deadline van huidige maand (tenzij exception actief)
     # - Ouder dan vorige maand: niet toegestaan
     if date_obj >= current_month_start:
         # Huidige maand - OK
         pass
-    elif date_obj >= previous_month_start and today <= deadline_previous_month:
-        # Vorige maand voor deadline - OK
-        msgs.append(f"ℹ️ Let op: je corrigeert een rit uit de vorige maand (deadline: {deadline_previous_month})")
+    elif date_obj >= previous_month_start:
+        # Vorige maand - check deadline OF exception
+        if today <= deadline_previous_month or has_exception:
+            msgs.append(f"ℹ️ Let op: je corrigeert een rit uit de vorige maand (deadline: {deadline_previous_month})")
+        else:
+            return False, [f"❌ Deze datum kan niet meer worden ingevoerd (alleen huidige + vorige maand tot {deadline_previous_month})"], 0.0
     else:
         # Te oud of na deadline
         return False, [f"❌ Deze datum kan niet meer worden ingevoerd (alleen huidige + vorige maand tot {deadline_previous_month})"], 0.0
@@ -174,7 +201,7 @@ def validate_ride_submission(employee, date_obj, trajectory_name, ride_type):
     if employee["country"] == "BE":
         amount = total_km * cfg["BE_RATE"]
         
-        # Fiscale Limiet Check (NU MET MAAND/JAAR KEUZE!)
+        # Fiscale Limiet Check (NU MET MAAND/JAAR KEUZE + ENFORCE MODE!)
         if cfg["BE_LIMIT_TYPE"] == "MONTHLY":
             # Bereken maand totaal
             month_start = date(date_obj.year, date_obj.month, 1)
@@ -185,22 +212,52 @@ def validate_ride_submission(employee, date_obj, trajectory_name, ride_type):
                 month_end = date(date_obj.year, next_month, 1) - relativedelta(days=1)
             
             month_total = calculate_period_total(employee["id"], month_start, month_end)
+            limit = cfg["BE_MONTHLY_LIMIT"]
             
-            if (month_total + amount) > cfg["BE_MONTHLY_LIMIT"]:
-                return False, [f"❌ Maandelijkse limiet (€{cfg['BE_MONTHLY_LIMIT']:.2f}) overschreden!"], 0.0
+            if (month_total + amount) > limit:
+                # Check enforcement mode
+                if cfg.get("BE_LIMIT_ENFORCE_MODE", "BLOCK") == "CAP":
+                    # Afkap-logica: vergoed gedeeltelijk tot limiet
+                    allowed_amount = max(0, limit - month_total)
+                    if allowed_amount > 0:
+                        original_amount = amount
+                        amount = allowed_amount
+                        allowed_km = allowed_amount / cfg["BE_RATE"] if cfg["BE_RATE"] > 0 else 0
+                        msgs.append(f"⚠️ Maandlimiet bereikt! Slechts {allowed_km:.1f}km van je rit wordt vergoed (€{allowed_amount:.2f} van €{original_amount:.2f})")
+                    else:
+                        return False, [f"❌ Maandelijkse limiet (€{limit:.2f}) volledig bereikt. Geen vergoeding mogelijk."], 0.0
+                else:  # BLOCK mode
+                    return False, [f"❌ Maandelijkse limiet (€{limit:.2f}) overschreden!"], 0.0
         else:  # YEARLY
             # Bereken jaar totaal
             year_start = date(date_obj.year, 1, 1)
             year_end = date(date_obj.year, 12, 31)
             year_total = calculate_period_total(employee["id"], year_start, year_end)
+            limit = cfg["BE_YEARLY_LIMIT"]
             
-            if (year_total + amount) > cfg["BE_YEARLY_LIMIT"]:
-                return False, [f"❌ Jaarlijkse limiet (€{cfg['BE_YEARLY_LIMIT']:.2f}) overschreden!"], 0.0
+            if (year_total + amount) > limit:
+                # Check enforcement mode
+                if cfg.get("BE_LIMIT_ENFORCE_MODE", "BLOCK") == "CAP":
+                    # Afkap-logica: vergoed gedeeltelijk tot limiet
+                    allowed_amount = max(0, limit - year_total)
+                    if allowed_amount > 0:
+                        original_amount = amount
+                        amount = allowed_amount
+                        allowed_km = allowed_amount / cfg["BE_RATE"] if cfg["BE_RATE"] > 0 else 0
+                        msgs.append(f"⚠️ Jaarlimiet bereikt! Slechts {allowed_km:.1f}km van je rit wordt vergoed (€{allowed_amount:.2f} van €{original_amount:.2f})")
+                    else:
+                        return False, [f"❌ Jaarlijkse limiet (€{limit:.2f}) volledig bereikt. Geen vergoeding mogelijk."], 0.0
+                else:  # BLOCK mode
+                    return False, [f"❌ Jaarlijkse limiet (€{limit:.2f}) overschreden!"], 0.0
             
     elif employee["country"] == "NL":
+        # NEW v4.3: Bedrijfsfiets kan nu een configureerbaar tarief hebben (wel belastbaar)
         if employee["bike_type"] == "company":
-            amount = 0.0
-            msgs.append("ℹ️ Bedrijfsfiets (NL) = €0 vergoeding.")
+            amount = total_km * cfg["NL_COMPANY_BIKE_RATE"]
+            if cfg["NL_COMPANY_BIKE_RATE"] == 0.0:
+                msgs.append("ℹ️ Bedrijfsfiets (NL) = €0 vergoeding.")
+            else:
+                msgs.append(f"⚠️ Bedrijfsfiets (NL) = €{cfg['NL_COMPANY_BIKE_RATE']:.2f}/km (BELASTBAAR inkomen).")
         else:
             amount = total_km * cfg["NL_RATE"]
 
@@ -266,11 +323,22 @@ def render_hr_dashboard():
             
         with c2:
             st.markdown("##### 🇳🇱 Nederland")
-            new_nl = st.number_input("Tarief NL (€/km)", value=st.session_state.config["NL_RATE"], step=0.01)
+            new_nl = st.number_input("Tarief NL Eigen Fiets (€/km)", value=st.session_state.config["NL_RATE"], step=0.01)
             
             # Fiscale waarschuwingen Nederland
             if new_nl >= 0.24:  # Boven €0.23 = belastbaar
                 st.warning(f"⚠️ **Fiscale waarschuwing:** Dit tarief (€{new_nl:.2f}) is hoger dan het wettelijk vrijgestelde maximum van €0.23. Het surplus is belastbaar voor de werknemer!")
+            
+            # NEW v4.3: Bedrijfsfiets tarief (altijd belastbaar)
+            st.markdown("**Tarief Bedrijfsfiets (NL):**")
+            new_nl_company = st.number_input(
+                "Tarief NL Bedrijfsfiets (€/km)",
+                value=st.session_state.config["NL_COMPANY_BIKE_RATE"],
+                step=0.01,
+                help="Vergoeding voor bedrijfsfietsen is altijd belastbaar inkomen. Stel in op €0.00 om geen vergoeding te geven, of hoger om fietsen te promoten."
+            )
+            if new_nl_company > 0:
+                st.caption("⚠️ Dit bedrag is belastbaar inkomen voor de werknemer.")
         
         # NIEUWE FEATURE: Deadline Configuratie
         st.divider()
@@ -284,10 +352,27 @@ def render_hr_dashboard():
         )
         st.caption(f"Medewerkers kunnen ritten invoeren voor de huidige maand en de vorige maand tot de {new_deadline_day}e.")
         
+        # NIEUWE FEATURE: BE Limiet Enforcement Mode
+        st.divider()
+        st.markdown("##### 🛡️ België - Limiet Handhaving")
+        new_enforce_mode = st.radio(
+            "Wat gebeurt er als een rit de limiet overschrijdt?",
+            options=["BLOCK", "CAP"],
+            index=0 if st.session_state.config.get("BE_LIMIT_ENFORCE_MODE", "BLOCK") == "BLOCK" else 1,
+            horizontal=True,
+            help="BLOCK = Volledige rit wordt geweigerd | CAP = Gedeeltelijke vergoeding tot aan limiet"
+        )
+        if new_enforce_mode == "BLOCK":
+            st.caption("🚫 **BLOCK modus:** Ritten die de limiet overschrijden worden volledig geweigerd.")
+        else:
+            st.caption("✂️ **CAP modus:** Het systeem vergoedt gedeeltelijk tot aan de limiet (overschrijdende kilometers worden niet vergoed).")
+        
         if st.button("💾 Sla Configuratie Op"):
             st.session_state.config["BE_RATE"] = new_be
             st.session_state.config["BE_LIMIT_TYPE"] = new_limit_type
+            st.session_state.config["BE_LIMIT_ENFORCE_MODE"] = new_enforce_mode
             st.session_state.config["NL_RATE"] = new_nl
+            st.session_state.config["NL_COMPANY_BIKE_RATE"] = new_nl_company  # NEW v4.3
             st.session_state.config["DEADLINE_DAY"] = new_deadline_day
             
             # Update limits based on type
@@ -351,6 +436,60 @@ def render_hr_dashboard():
                         st.session_state.employees[selected_emp]["trajectories"][new_traj_name] = new_traj_dist
                         st.success(f"✅ Traject '{new_traj_name}' goedgekeurd voor {selected_emp}!")
                         st.rerun()
+        
+        # NEW v4.3: Deadline Exceptions Management
+        st.divider()
+        st.markdown("##### ⏰ Uitzonderingen Beheer (Deadline Override)")
+        st.caption("Sta een specifieke medewerker toe om ritten in te voeren na de deadline (bijv. wegens ziekte).")
+        
+        col_exc_1, col_exc_2 = st.columns(2)
+        
+        with col_exc_1:
+            with st.form("add_exception"):
+                exc_employee = st.selectbox("Medewerker", list(st.session_state.employees.keys()))
+                exc_until = st.date_input(
+                    "Uitzondering geldig tot",
+                    value=date.today() + relativedelta(days=7),
+                    help="Deze medewerker mag tot deze datum ritten voor de vorige maand invoeren"
+                )
+                
+                if st.form_submit_button("✅ Sta Uitzondering Toe"):
+                    emp_id = st.session_state.employees[exc_employee]["id"]
+                    st.session_state.deadline_exceptions[emp_id] = exc_until
+                    st.success(f"✅ Uitzondering voor {exc_employee} actief tot {exc_until}")
+                    st.rerun()
+        
+        with col_exc_2:
+            st.markdown("**Actieve Uitzonderingen:**")
+            if st.session_state.deadline_exceptions:
+                today = date.today()
+                active_exceptions = []
+                expired_exceptions = []
+                
+                for emp_id, exp_date in st.session_state.deadline_exceptions.items():
+                    # Find employee name
+                    emp_name = "Onbekend"
+                    for key, emp_data in st.session_state.employees.items():
+                        if emp_data["id"] == emp_id:
+                            emp_name = key
+                            break
+                    
+                    if exp_date >= today:
+                        active_exceptions.append(f"✅ {emp_name} (tot {exp_date})")
+                    else:
+                        expired_exceptions.append(emp_id)
+                
+                # Clean up expired exceptions
+                for exp_id in expired_exceptions:
+                    del st.session_state.deadline_exceptions[exp_id]
+                
+                if active_exceptions:
+                    for exc in active_exceptions:
+                        st.info(exc)
+                else:
+                    st.caption("Geen actieve uitzonderingen")
+            else:
+                st.caption("Geen uitzonderingen ingesteld")
 
     with tab3:
         st.subheader("📊 Export naar Payroll")
@@ -364,10 +503,24 @@ def render_hr_dashboard():
             # Preview van te exporteren ritten
             df = pd.DataFrame(unprocessed_rides)
             df_display = df.copy()
+            
+            # NEW v4.3: Add Fiscal Status column
+            def get_fiscal_status(row):
+                # Find employee data
+                for emp_data in st.session_state.employees.values():
+                    if emp_data["id"] == row["employee_id"]:
+                        if emp_data["country"] == "NL" and emp_data["bike_type"] == "company":
+                            return "BELAST"
+                        return "ONBELAST"
+                return "ONBELAST"
+            
+            df["fiscal_status"] = df.apply(get_fiscal_status, axis=1)
+            
             df_display["date"] = pd.to_datetime(df_display["date"]).dt.strftime("%d-%m-%Y")
             df_display["distance"] = df_display["distance"].apply(lambda x: f"{x} km")
             df_display["amount"] = df_display["amount"].apply(lambda x: f"€{x:.2f}")
             df_display["rate_applied"] = df_display["rate_applied"].apply(lambda x: f"€{x:.2f}/km")
+            df_display["fiscal_status"] = df["fiscal_status"]
             
             df_display = df_display.rename(columns={
                 "date": "Datum",
@@ -376,7 +529,8 @@ def render_hr_dashboard():
                 "trajectory": "Traject",
                 "distance": "Afstand",
                 "amount": "Bedrag",
-                "rate_applied": "Tarief"
+                "rate_applied": "Tarief",
+                "fiscal_status": "Fiscaal Statuut"
             })
             
             st.dataframe(df_display, use_container_width=True, hide_index=True)
@@ -479,11 +633,11 @@ def render_employee_portal():
     month_total = calculate_period_total(employee["id"], month_start, month_end)
     year_total = calculate_period_total(employee["id"], year_start, year_end)
     
-    # Determine rate
+    # Determine rate (v4.3: Updated for NL company bikes)
     if employee["country"] == "BE":
         rate = st.session_state.config["BE_RATE"]
     elif employee["bike_type"] == "company":
-        rate = 0.00
+        rate = st.session_state.config["NL_COMPANY_BIKE_RATE"]  # NEW v4.3: Configurable
     else:
         rate = st.session_state.config["NL_RATE"]
     
@@ -528,6 +682,13 @@ def render_employee_portal():
                     
                     st.progress(progress, text=f"€{remaining:.2f} resterend")
         
+        # NIEUWE FEATURE v4.2: Ritten Vandaag Counter
+        st.divider()
+        rides_today_count = len([r for r in st.session_state.rides 
+                                 if r["employee_id"] == employee["id"] 
+                                 and r["date"] == today])
+        st.caption(f"🚴 **Ritten vandaag:** {rides_today_count}/{st.session_state.config['MAX_RIDES_DAY']}")
+        
         # Deadline reminder
         deadline_day = st.session_state.config["DEADLINE_DAY"]
         deadline_date = date(today.year, today.month, deadline_day)
@@ -538,6 +699,9 @@ def render_employee_portal():
 
     # 2. Rit Registratie (Transactionele Data)
     st.subheader("📝 Nieuwe Rit Registreren")
+    # NIEUWE FEATURE v4.2: Tooltip voor 2-ritten flexibiliteit
+    st.caption("💡 **Tip:** Je kunt tot 2 verschillende ritten per dag invoeren (bijv. ochtend: Traject A, avond: Traject B)")
+    
     with st.form("ride_add"):
         c1, c2 = st.columns(2)
         with c1:
@@ -630,7 +794,7 @@ def render_employee_portal():
 # =============================================================================
 
 def main():
-    st.set_page_config(page_title="Fietsvergoeding v4.0", layout="wide")
+    st.set_page_config(page_title="Fietsvergoeding v4.3", layout="wide")
     init_session_state()
     
     # SIDEBAR: Rol Selectie (RBAC Simulatie)
